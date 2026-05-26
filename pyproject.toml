@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mor-turboquant"
+version = "0.1.0"
+description = "Recursion-aware compressed KV cache: MoR adaptive compute + TurboQuant compression"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-benchmark"]
+
+[tool.setuptools.packages.find]
+include = ["mor_tq*"]
