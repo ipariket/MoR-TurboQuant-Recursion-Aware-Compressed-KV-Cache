@@ -11,7 +11,7 @@ from mor_tq.config import MoRConfig
 from mor_tq.model import MoRModel
 from mor_tq.router import AdaptiveRouter
 from mor_tq.kv_cache import RecursionAwareKVCache
-from mor_tq.compression import PolarQuantCompressor
+from mor_tq.compression import TurboQuantCompressor, PolarQuantCompressor
 from mor_tq.recursive_block import RecursiveTransformerBlock
 
 __version__ = "0.1.0"
@@ -22,5 +22,6 @@ __all__ = [
     "AdaptiveRouter",
     "RecursionAwareKVCache",
     "PolarQuantCompressor",
+    "TurboQuantCompressor",
     "RecursiveTransformerBlock",
 ]

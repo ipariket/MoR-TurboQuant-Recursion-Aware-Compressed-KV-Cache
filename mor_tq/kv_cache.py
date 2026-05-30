@@ -22,7 +22,7 @@ Memory model:
 import torch
 import torch.nn as nn
 from typing import Optional
-from mor_tq.compression import PolarQuantCompressor, CompressedKV
+from mor_tq.compression import TurboQuantCompressor, CompressedKV
 
 
 class RecursionAwareKVCache(nn.Module):
@@ -45,6 +45,7 @@ class RecursionAwareKVCache(nn.Module):
         kv_bits: int = 3,
         group_size: int = 128,
         mode: str = "recursion_wise",
+        use_qjl: bool = True,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -54,14 +55,14 @@ class RecursionAwareKVCache(nn.Module):
         self.kv_bits = kv_bits
         self.mode = mode
 
-        # Compressor (shared for K and V — TurboQuant uses separate codebooks
-        # for K vs V in production, but we use the same for simplicity)
+        # TurboQuant compressor with optional QJL correction
         self.compress_enabled = kv_bits > 0
         if self.compress_enabled:
-            self.compressor = PolarQuantCompressor(
+            self.compressor = TurboQuantCompressor(
                 head_dim=head_dim,
                 bits=kv_bits,
                 group_size=group_size,
+                use_qjl=use_qjl,
             )
 
         # Storage — initialized lazily on first use

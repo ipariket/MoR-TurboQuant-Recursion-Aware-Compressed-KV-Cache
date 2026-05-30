@@ -1,16 +1,13 @@
 """
-Inference KV Memory Benchmark
+KV Cache Memory Benchmark — 4-way comparison.
 
-Measures KV cache memory two ways:
-  1. Analytical: exact byte count from architecture math
-  2. Hardware: actual CUDA memory delta (when GPU available)
+Measures KV cache memory for:
+  1. Standard transformer (baseline)
+  2. Standard + TurboQuant (compression only)
+  3. MoR only (early exit only)
+  4. MoR + TurboQuant (our full system)
 
-Run after training: python benchmark_kv.py
-
-Produces tables showing real measurements for:
-  - Standard transformer (all layers, FP16)
-  - MoR only (early exit, FP16)
-  - MoR + 3-bit (early exit + compression)
+Run: python benchmark_kv.py
 """
 
 import torch
@@ -19,57 +16,18 @@ import gc
 from mor_tq import MoRConfig, MoRModel
 
 
-def measure_cuda_memory(model, input_ids):
-    """Measure actual CUDA memory consumed by a forward pass.
-
-    Returns the memory delta (peak - before) which isolates
-    the KV cache + activation cost from model weight cost.
-    """
-    if not torch.cuda.is_available():
-        return None
-
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    mem_before = torch.cuda.memory_allocated()
-
-    with torch.no_grad():
-        output = model(input_ids)
-
-    torch.cuda.synchronize()
-    mem_peak = torch.cuda.max_memory_allocated()
-    mem_delta = mem_peak - mem_before
-
-    return {
-        "mem_before_bytes": mem_before,
-        "mem_peak_bytes": mem_peak,
-        "mem_delta_bytes": mem_delta,
-        "kv_stats": output.kv_stats,
-        "exit_depths": output.exit_depths,
-    }
-
-
 def benchmark_config(name, config, seq_lengths, device="cpu"):
-    """Run inference at various seq lengths and measure KV memory."""
     model = MoRModel(config).to(device)
     model.eval()
-
     total_params = sum(p.numel() for p in model.parameters())
-    param_stats = model.count_parameters()
 
-    results = {
-        "name": name,
-        "total_params": total_params,
-        "param_savings": round(param_stats["parameter_savings"] * 100, 1),
-        "seq_length_results": [],
-    }
+    results = {"name": name, "total_params": total_params, "seq_length_results": []}
 
     for seq_len in seq_lengths:
         if seq_len > config.max_seq_len:
             continue
-
         input_ids = torch.randint(0, config.vocab_size, (1, seq_len)).to(device)
 
-        # Analytical measurement
         with torch.no_grad():
             output = model(input_ids)
 
@@ -80,17 +38,19 @@ def benchmark_config(name, config, seq_lengths, device="cpu"):
             "mor_bytes": stats["mor_baseline_bytes"],
             "actual_bytes": stats["actual_bytes"],
             "compression_vs_standard": round(stats["compression_vs_standard"], 2),
-            "compression_vs_mor": round(stats["compression_vs_mor"], 2),
             "active_fraction": round(stats["active_token_fraction"] * 100, 1),
         }
 
-        # Hardware measurement (CUDA only)
         if device == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
-            hw = measure_cuda_memory(model, input_ids)
-            if hw:
-                entry["cuda_delta_bytes"] = hw["mem_delta_bytes"]
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+            mem_before = torch.cuda.memory_allocated()
+            with torch.no_grad():
+                output = model(input_ids)
+            torch.cuda.synchronize()
+            entry["cuda_delta_bytes"] = torch.cuda.max_memory_allocated() - mem_before
 
         results["seq_length_results"].append(entry)
 
@@ -101,11 +61,11 @@ def benchmark_config(name, config, seq_lengths, device="cpu"):
 
 
 def main():
-    print("=" * 80)
-    print("KV Cache Memory Benchmark: Inference-Time Measurement")
-    print("=" * 80)
+    print("=" * 100)
+    print("KV Cache Memory Benchmark: 4-Way Comparison")
+    print("=" * 100)
 
-    device = "cpu"  # CPU is fine for memory measurement
+    device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -115,29 +75,28 @@ def main():
     MAX_SEQ = 2048
     SEQ_LENGTHS = [64, 128, 256, 512, 1024, 2048]
 
-    COMMON = dict(
-        d_model=512,
-        n_heads=8,
-        d_ff=2048,
-        vocab_size=1000,
-        max_seq_len=MAX_SEQ,
-        dropout=0.0,
-    )
+    COMMON = dict(d_model=512, n_heads=8, d_ff=2048, vocab_size=1000, max_seq_len=MAX_SEQ, dropout=0.0)
 
     configs = {
-        "Standard 8-layer": MoRConfig(
+        "Standard": MoRConfig(
             **COMMON, n_recursions=8, sharing_strategy="full",
             capacity_factor=1.0, routing_strategy="expert", kv_bits=0,
         ),
-        "MoR only (no compress)": MoRConfig(
+        "TurboQuant only": MoRConfig(
+            **COMMON, n_recursions=8, sharing_strategy="full",
+            capacity_factor=1.0, routing_strategy="expert",
+            kv_bits=3, use_qjl=True,
+        ),
+        "MoR only": MoRConfig(
             **COMMON, n_recursions=8, sharing_strategy="middle_cycle",
             n_unique_intro=1, n_unique_outro=1,
             capacity_factor=0.5, routing_strategy="expert", kv_bits=0,
         ),
-        "MoR + 3-bit (Ours)": MoRConfig(
+        "MoR+TurboQuant": MoRConfig(
             **COMMON, n_recursions=8, sharing_strategy="middle_cycle",
             n_unique_intro=1, n_unique_outro=1,
-            capacity_factor=0.5, routing_strategy="expert", kv_bits=3,
+            capacity_factor=0.5, routing_strategy="expert",
+            kv_bits=3, use_qjl=True,
         ),
     }
 
@@ -146,92 +105,50 @@ def main():
         print(f"Benchmarking: {name}...")
         all_results[name] = benchmark_config(name, cfg, SEQ_LENGTHS, device)
 
-    # Print comparison table
-    print(f"\n{'=' * 100}")
-    print("KV Cache Memory Usage (bytes per sample, batch=1)")
-    print(f"{'=' * 100}")
-
-    header = f"{'Seq Len':>8}"
-    for name in configs:
-        short = name.split("(")[0].strip()[:20]
-        header += f" | {short:>16}"
-    header += " | {'Compression':>12}"
-    print(f"{'Seq Len':>8} | {'Standard':>16} | {'MoR only':>16} | {'MoR+3bit (Ours)':>16} | {'vs Standard':>12} | {'vs MoR':>12}")
-    print("-" * 100)
-
     names = list(configs.keys())
-    for i, seq_len in enumerate(SEQ_LENGTHS):
-        row = f"{seq_len:>8}"
 
+    print(f"\n{'=' * 110}")
+    print("KV Cache Memory (bytes per sample, batch=1)")
+    print(f"{'=' * 110}")
+    print(f"{'Seq':>6} | {'Standard':>14} | {'TurboQuant':>14} | {'MoR only':>14} | {'MoR+TQ (Ours)':>14} | {'TQ ratio':>10} | {'Ours ratio':>10}")
+    print("-" * 110)
+
+    for i, seq_len in enumerate(SEQ_LENGTHS):
         bytes_list = []
         for name in names:
             res = all_results[name]["seq_length_results"]
-            if i < len(res):
-                b = res[i]["actual_bytes"]
-                bytes_list.append(b)
-                row += f" | {b:>16,}"
-            else:
-                bytes_list.append(0)
-                row += f" | {'N/A':>16}"
+            b = res[i]["actual_bytes"] if i < len(res) else 0
+            bytes_list.append(b)
 
-        if len(bytes_list) == 3 and bytes_list[2] > 0:
-            vs_std = bytes_list[0] / max(1, bytes_list[2])
-            vs_mor = bytes_list[1] / max(1, bytes_list[2])
-            row += f" | {vs_std:>11.2f}x | {vs_mor:>11.2f}x"
+        tq_ratio = bytes_list[0] / max(1, bytes_list[1]) if bytes_list[1] > 0 else 0
+        ours_ratio = bytes_list[0] / max(1, bytes_list[3]) if bytes_list[3] > 0 else 0
 
-        print(row)
+        print(f"{seq_len:>6} | {bytes_list[0]:>14,} | {bytes_list[1]:>14,} | {bytes_list[2]:>14,} | {bytes_list[3]:>14,} | {tq_ratio:>9.2f}x | {ours_ratio:>9.2f}x")
 
-    print(f"{'=' * 100}")
+    print(f"{'=' * 110}")
 
     # Summary
-    ours_results = all_results[names[2]]["seq_length_results"]
-    if ours_results:
-        avg_compression = sum(r["compression_vs_standard"] for r in ours_results) / len(ours_results)
-        avg_active = sum(r["active_fraction"] for r in ours_results) / len(ours_results)
-        print(f"\nAverage compression vs standard: {avg_compression:.2f}x")
-        print(f"Average active token fraction: {avg_active:.1f}%")
-        print(f"\nBreakdown:")
-        print(f"  Early exit contribution: {sum(r['compression_vs_standard']/r['compression_vs_mor'] for r in ours_results)/len(ours_results):.2f}x")
-        print(f"  Compression contribution: {sum(r['compression_vs_mor'] for r in ours_results)/len(ours_results):.2f}x")
-        print(f"  Combined (multiplicative): {avg_compression:.2f}x")
-
-    # Scaling analysis
-    print(f"\n{'=' * 80}")
-    print("Scaling: KV Memory at 2048 tokens (what matters for real inference)")
-    print(f"{'=' * 80}")
+    print(f"\nCompression Breakdown at seq_len=2048:")
     for name in names:
-        res = all_results[name]["seq_length_results"]
-        if res:
-            last = res[-1]
-            mb = last["actual_bytes"] / (1024 * 1024)
-            print(f"  {name:<30} {last['actual_bytes']:>12,} bytes ({mb:.2f} MB)")
+        res = all_results[name]["seq_length_results"][-1]
+        mb = res["actual_bytes"] / (1024 * 1024)
+        print(f"  {name:<20} {res['actual_bytes']:>12,} bytes ({mb:.2f} MB) = {res['compression_vs_standard']:.2f}x vs standard")
 
-    # Save
+    # Multiplicative analysis
+    tq_ratio = all_results["Standard"]["seq_length_results"][-1]["actual_bytes"] / \
+               max(1, all_results["TurboQuant only"]["seq_length_results"][-1]["actual_bytes"])
+    mor_ratio = all_results["Standard"]["seq_length_results"][-1]["actual_bytes"] / \
+                max(1, all_results["MoR only"]["seq_length_results"][-1]["actual_bytes"])
+    combined = all_results["Standard"]["seq_length_results"][-1]["actual_bytes"] / \
+               max(1, all_results["MoR+TurboQuant"]["seq_length_results"][-1]["actual_bytes"])
+
+    print(f"\n  TurboQuant contribution: {tq_ratio:.2f}x")
+    print(f"  MoR contribution:       {mor_ratio:.2f}x")
+    print(f"  Combined:               {combined:.2f}x (multiplicative: {tq_ratio:.2f} × {mor_ratio:.2f} = {tq_ratio*mor_ratio:.2f}x)")
+
     with open("kv_benchmark_results.json", "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nResults saved to kv_benchmark_results.json")
-
-    # Hardware memory measurement (CUDA only)
-    if device == "cuda":
-        print(f"\n{'=' * 80}")
-        print("HARDWARE VALIDATION: Actual CUDA Memory Delta (torch.cuda)")
-        print(f"{'=' * 80}")
-        print(f"{'Seq Len':>8} | {'Standard Delta':>16} | {'MoR+3bit Delta':>16} | {'HW Reduction':>14}")
-        print("-" * 70)
-
-        std_results = all_results[names[0]]["seq_length_results"]
-        ours_results = all_results[names[2]]["seq_length_results"]
-
-        for i in range(len(std_results)):
-            seq_len = std_results[i]["seq_len"]
-            std_delta = std_results[i].get("cuda_delta_bytes", 0)
-            ours_delta = ours_results[i].get("cuda_delta_bytes", 0)
-            if std_delta > 0 and ours_delta > 0:
-                hw_ratio = std_delta / ours_delta
-                print(f"{seq_len:>8} | {std_delta:>14,} B | {ours_delta:>14,} B | {hw_ratio:>13.2f}x")
-
-        print(f"\nNote: CUDA deltas include activations + KV cache. Analytical")
-        print(f"measurement isolates KV cache only and is more precise.")
 
 
 if __name__ == "__main__":

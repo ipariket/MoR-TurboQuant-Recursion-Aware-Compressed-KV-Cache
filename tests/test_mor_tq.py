@@ -18,46 +18,57 @@ from mor_tq import (
 
 class TestPolarQuantCompressor:
     def setup_method(self):
-        self.compressor = PolarQuantCompressor(head_dim=64, bits=3, group_size=64)
+        # 3-bit total = 2-bit PolarQuant + 1-bit QJL
+        self.compressor = PolarQuantCompressor(head_dim=64, bits=3, group_size=64, use_qjl=True)
+        self.compressor_no_qjl = PolarQuantCompressor(head_dim=64, bits=3, group_size=64, use_qjl=False)
 
     def test_compress_decompress_roundtrip(self):
         """Compression → decompression should approximately reconstruct."""
-        x = torch.randn(4, 8, 32, 64)  # (batch, heads, seq, head_dim)
+        x = torch.randn(4, 8, 32, 64)
         compressed = self.compressor.compress(x)
         reconstructed = self.compressor.decompress(compressed)
 
         assert reconstructed.shape == x.shape
-        # Check relative reconstruction quality (cosine similarity per vector)
         x_flat = x.reshape(-1, 64)
         r_flat = reconstructed.reshape(-1, 64)
         cos_sim = torch.nn.functional.cosine_similarity(x_flat, r_flat, dim=-1).mean()
-        assert cos_sim > 0.5, f"Cosine similarity too low: {cos_sim:.3f}"
+        assert cos_sim > 0.3, f"Cosine similarity too low: {cos_sim:.3f}"
+
+    def test_compress_decompress_no_qjl(self):
+        """Without QJL, PolarQuant still works."""
+        x = torch.randn(4, 8, 32, 64)
+        compressed = self.compressor_no_qjl.compress(x)
+        reconstructed = self.compressor_no_qjl.decompress(compressed)
+        assert reconstructed.shape == x.shape
 
     def test_3bit_packing_roundtrip(self):
-        """3-bit pack/unpack should be lossless."""
-        indices = torch.randint(0, 8, (1024,), dtype=torch.uint8)
+        """PolarQuant index pack/unpack should be lossless."""
+        # With QJL, 3-bit total = 2-bit PQ, so indices are 0-3
+        n_centroids = self.compressor.n_centroids  # 4 for 2-bit PQ
+        indices = torch.randint(0, n_centroids, (1024,), dtype=torch.uint8)
         packed = self.compressor._pack_indices(indices.unsqueeze(0))
         unpacked = self.compressor._unpack_indices(packed, 1024)
         assert torch.equal(indices, unpacked)
 
     def test_4bit_packing_roundtrip(self):
-        comp4 = PolarQuantCompressor(head_dim=64, bits=4, group_size=64)
-        indices = torch.randint(0, 16, (1024,), dtype=torch.uint8)
+        # 4-bit total = 3-bit PQ + 1-bit QJL
+        comp4 = PolarQuantCompressor(head_dim=64, bits=4, group_size=64, use_qjl=True)
+        n_centroids = comp4.n_centroids  # 8 for 3-bit PQ
+        indices = torch.randint(0, n_centroids, (1024,), dtype=torch.uint8)
         packed = comp4._pack_indices(indices.unsqueeze(0))
         unpacked = comp4._unpack_indices(packed, 1024)
         assert torch.equal(indices, unpacked)
 
     def test_compression_ratio(self):
         ratio = self.compressor.compression_ratio()
-        # 3-bit with fp32 norms per 64-element group:
-        # effective bits = 3 + 32/64 = 3.5 → ratio ≈ 16/3.5 ≈ 4.57
-        assert ratio > 4.0
+        # 2-bit PQ + 1-bit QJL + overhead → ratio ~3-5x
+        assert ratio > 2.5
         assert ratio < 6.0
 
     def test_memory_bytes(self):
         stats = self.compressor.memory_bytes(n_tokens=1024, n_heads=8)
         assert stats["compressed_bytes"] < stats["fp16_bytes"]
-        assert stats["ratio"] > 3.5
+        assert stats["ratio"] > 2.5
 
 
 # ============================================================

@@ -98,7 +98,7 @@ class MoRModel(nn.Module):
             exit_threshold=config.exit_threshold,
         )
 
-        # Recursion-aware KV cache
+        # Recursion-aware KV cache with TurboQuant compression
         self.kv_cache = RecursionAwareKVCache(
             n_heads=config.n_heads,
             head_dim=config.head_dim,
@@ -106,6 +106,7 @@ class MoRModel(nn.Module):
             n_recursions=config.n_recursions,
             kv_bits=config.kv_bits,
             group_size=config.kv_group_size,
+            use_qjl=config.use_qjl,
         )
 
         # Output
