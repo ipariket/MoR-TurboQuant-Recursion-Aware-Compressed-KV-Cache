@@ -185,7 +185,18 @@ class RecursionAwareKVCache(nn.Module):
         return cached
 
     def memory_stats(self) -> dict:
-        """Calculate actual vs baseline memory usage."""
+        """Calculate actual vs baseline memory usage.
+
+        All calculations are normalized to per-sample (batch=1) to give
+        architecture-level comparison independent of batch size.
+        """
+        # Determine batch size from the first available mask
+        batch_size = 1
+        for m in self._active_masks:
+            if m is not None:
+                batch_size = m.shape[0]
+                break
+
         baseline_bytes = 0
         actual_bytes = 0
 
@@ -194,25 +205,26 @@ class RecursionAwareKVCache(nn.Module):
             if mask is None:
                 continue
 
-            n_active = mask.sum().item()
-            n_total = mask.numel()
+            # Normalize to per-sample: average active tokens per sample
+            n_active_per_sample = mask.sum().item() / batch_size
+            seq_len = mask.shape[1]
 
-            # Baseline: all tokens, FP16, at this recursion
-            layer_baseline = n_total * self.n_heads * self.head_dim * 2 * 2  # ×2 for K+V, ×2 bytes
-            baseline_bytes += layer_baseline
+            # MoR baseline: active tokens only, FP16 (what MoR would use without compression)
+            mor_layer_baseline = int(n_active_per_sample) * self.n_heads * self.head_dim * 2 * 2
+            baseline_bytes += mor_layer_baseline
 
             if self.compress_enabled:
-                # Compressed: only active tokens
-                stats = self.compressor.memory_bytes(n_active, self.n_heads)
+                # Compressed: only active tokens per sample
+                stats = self.compressor.memory_bytes(int(n_active_per_sample), self.n_heads)
                 actual_bytes += stats["compressed_bytes"] * 2  # K + V
             else:
-                actual_bytes += n_active * self.n_heads * self.head_dim * 2 * 2
+                actual_bytes += int(n_active_per_sample) * self.n_heads * self.head_dim * 2 * 2
 
-        # Also compute what a standard transformer would use
-        # (all layers = all recursions, all tokens, no compression)
+        # Standard transformer baseline (per sample):
+        # all layers × all tokens × full precision
         standard_baseline = (
             self.n_recursions
-            * self._seq_len  # all tokens
+            * self._seq_len
             * self.n_heads
             * self.head_dim
             * 2  # K + V

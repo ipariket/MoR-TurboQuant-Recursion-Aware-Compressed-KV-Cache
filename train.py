@@ -2,8 +2,8 @@
 MoR-TurboQuant Training on WikiText-103
 Run: python train.py
 
-Optimized for Apple M4 Mac Mini (16GB)
-Uses MPS (Metal Performance Shaders) for GPU acceleration
+Trains baseline and MoR+3-bit models, compares perplexity and KV memory.
+Works on CUDA (H100/A100), MPS (Apple Silicon), or CPU.
 """
 
 import torch
@@ -18,23 +18,25 @@ from torch.utils.data import Dataset, DataLoader
 # Config
 # ============================================================
 SEQ_LEN = 256
-BATCH_SIZE = 16          # smaller batch for 16GB RAM
-N_EPOCHS = 2             # 2 epochs balances quality vs time
+BATCH_SIZE = 32  # H100 can handle larger batches
+N_EPOCHS = 2
 LR = 3e-4
 EVAL_EVERY = 500
-LOG_EVERY = 50
+LOG_EVERY = 100
 GRAD_CLIP = 1.0
 ROUTER_LOSS_WEIGHT = 0.01
 
 # ============================================================
 # Device setup
 # ============================================================
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("Using Apple M4 GPU (MPS)")
-elif torch.cuda.is_available():
+if torch.cuda.is_available():
     device = torch.device("cuda")
     print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+    BATCH_SIZE = 64  # larger batch for datacenter GPUs
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using Apple Silicon GPU (MPS)")
+    BATCH_SIZE = 16  # smaller batch for 16GB
 else:
     device = torch.device("cpu")
     print("Using CPU (will be slow)")
@@ -88,17 +90,20 @@ class TokenDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
+num_workers = 4 if torch.cuda.is_available() else 0
+pin_memory = torch.cuda.is_available()
+
 train_loader = DataLoader(
     TokenDataset(train_tokens, SEQ_LEN),
-    batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=False,
+    batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_memory,
 )
 val_loader = DataLoader(
     TokenDataset(val_tokens, SEQ_LEN),
-    batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+    batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory,
 )
 test_loader = DataLoader(
     TokenDataset(test_tokens, SEQ_LEN),
-    batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+    batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory,
 )
 print(f"Seq length: {SEQ_LEN} | Batch size: {BATCH_SIZE} | Train batches: {len(train_loader)}")
 
@@ -175,7 +180,7 @@ def evaluate(model, loader, max_batches=None):
         n_batches += 1
 
     avg_loss = total_loss / total_tokens
-    perplexity = math.exp(min(avg_loss, 20))  # cap to avoid overflow
+    perplexity = math.exp(min(avg_loss, 20))
     avg_kv_stats = {k: v / max(1, n_batches) for k, v in kv_stats_sum.items()}
 
     return perplexity, avg_loss, avg_kv_stats
@@ -229,8 +234,9 @@ def train_model(name, config):
                 ppl = math.exp(min(avg_loss, 20))
                 depth = output.exit_depths.float().mean().item()
                 active = output.kv_stats.get("active_token_fraction", 1.0)
+                kv_comp = output.kv_stats.get("compression_vs_standard", 1.0)
                 print(f"  Step {global_step:5d} | Loss {avg_loss:.3f} | PPL {ppl:.1f} | "
-                      f"Depth {depth:.1f} | Active {active:.0%} | {elapsed:.0f}s")
+                      f"Depth {depth:.1f} | Active {active:.0%} | KV {kv_comp:.1f}x | {elapsed:.0f}s")
 
             if global_step % EVAL_EVERY == 0:
                 val_ppl, val_loss, val_kv = evaluate(model, val_loader, max_batches=50)
@@ -261,8 +267,12 @@ def train_model(name, config):
         "best_val_ppl": round(best_val_ppl, 2),
         "total_params": total_params,
         "param_savings": round(param_stats["parameter_savings"] * 100, 1),
-        "kv_compression": round(test_kv.get("compression_vs_standard", 1.0), 1),
+        "kv_compression": round(test_kv.get("compression_vs_standard", 1.0), 2),
+        "kv_compression_vs_mor": round(test_kv.get("compression_vs_mor", 1.0), 2),
         "active_token_fraction": round(test_kv.get("active_token_fraction", 1.0) * 100, 1),
+        "kv_actual_bytes": test_kv.get("actual_bytes", 0),
+        "kv_standard_bytes": test_kv.get("standard_baseline_bytes", 0),
+        "kv_mor_bytes": test_kv.get("mor_baseline_bytes", 0),
         "training_time_min": round(total_time / 60, 1),
     }
 
@@ -270,7 +280,9 @@ def train_model(name, config):
           f"Params={total_params:,} | Time={total_time / 60:.1f}min")
 
     del model, optimizer
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
     return results
@@ -280,7 +292,7 @@ def train_model(name, config):
 # Train all variants
 # ============================================================
 print(f"\nStep 3: Training ({N_EPOCHS} epochs each)...")
-print(f"Estimated time: ~4-6 hours on M4 Mac Mini\n")
+print(f"Device: {device} | Batch size: {BATCH_SIZE}\n")
 
 all_results = []
 for name, cfg in configs.items():
@@ -290,16 +302,17 @@ for name, cfg in configs.items():
 # ============================================================
 # Print results table
 # ============================================================
-print(f"\n\n{'=' * 80}")
+print(f"\n\n{'=' * 90}")
 print("RESULTS: WikiText-103 Language Modeling")
-print(f"{'=' * 80}")
-print(f"{'Model':<30} {'Test PPL':>10} {'KV Compress':>12} {'Params':>12} {'Savings':>10}")
-print("-" * 80)
+print(f"{'=' * 90}")
+print(f"{'Model':<30} {'Test PPL':>10} {'KV Compress':>12} {'KV Bytes':>14} {'Params':>12} {'Savings':>10}")
+print("-" * 90)
 for r in all_results:
     kv = f"{r['kv_compression']}x"
     save = f"{r['param_savings']}%" if r['param_savings'] > 1 else "—"
-    print(f"{r['name']:<30} {r['test_ppl']:>10} {kv:>12} {r['total_params']:>12,} {save:>10}")
-print("=" * 80)
+    kv_bytes = f"{r['kv_actual_bytes']:,}"
+    print(f"{r['name']:<30} {r['test_ppl']:>10} {kv:>12} {kv_bytes:>14} {r['total_params']:>12,} {save:>10}")
+print("=" * 90)
 
 if len(all_results) == 2:
     baseline = all_results[0]['test_ppl']
@@ -308,6 +321,12 @@ if len(all_results) == 2:
     diff = ours - baseline
     print(f"\nKey finding: MoR + 3-bit KV achieves {kv}x KV memory reduction")
     print(f"with {diff:+.2f} perplexity difference vs standard transformer.")
+    print(f"\nKV Memory per sample (seq_len={SEQ_LEN}):")
+    print(f"  Standard:        {all_results[0]['kv_actual_bytes']:>10,} bytes")
+    print(f"  MoR + 3-bit:     {all_results[1]['kv_actual_bytes']:>10,} bytes")
+    print(f"  MoR early exit:  {all_results[1]['kv_compression'] / all_results[1]['kv_compression_vs_mor']:.2f}x savings")
+    print(f"  3-bit compress:  {all_results[1]['kv_compression_vs_mor']:.2f}x additional savings")
+    print(f"  Combined:        {all_results[1]['kv_compression']:.2f}x total savings")
 
 # Save results
 with open("training_results.json", "w") as f:
