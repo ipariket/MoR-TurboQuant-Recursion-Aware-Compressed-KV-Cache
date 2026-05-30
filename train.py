@@ -109,7 +109,7 @@ print(f"Seq length: {SEQ_LEN} | Batch size: {BATCH_SIZE} | Train batches: {len(t
 
 
 # ============================================================
-# Model configs — 4 variants for complete comparison
+# Model configs — 3 variants for comparison
 # ============================================================
 print("\nStep 2: Setting up models...")
 from mor_tq import MoRConfig, MoRModel
@@ -129,11 +129,6 @@ configs = {
         **COMMON, n_recursions=8,
         sharing_strategy="full", capacity_factor=1.0,
         routing_strategy="expert", kv_bits=3, use_qjl=True,
-    ),
-    "MoR only": MoRConfig(
-        **COMMON, n_recursions=8,
-        sharing_strategy="middle_cycle", n_unique_intro=1, n_unique_outro=1,
-        capacity_factor=0.5, routing_strategy="expert", kv_bits=0,
     ),
     "MoR + TurboQuant (Ours)": MoRConfig(
         **COMMON, n_recursions=8,
@@ -297,14 +292,13 @@ for r in all_results:
     print(f"{r['name']:<30} {r['test_ppl']:>10} {kv:>12} {kv_bytes:>14} {r['total_params']:>12,} {r['training_time_min']:>6.1f}m")
 print("=" * 95)
 
-if len(all_results) == 4:
-    std, tq, mor, ours = [r['test_ppl'] for r in all_results]
-    kv_std, kv_tq, kv_mor, kv_ours = [r['kv_compression'] for r in all_results]
+if len(all_results) == 3:
+    std, tq, ours = [r['test_ppl'] for r in all_results]
+    kv_std, kv_tq, kv_ours = [r['kv_compression'] for r in all_results]
     print(f"\nKey findings:")
     print(f"  TurboQuant alone:    {kv_tq}x KV reduction, PPL {tq} (vs baseline {std})")
-    print(f"  MoR alone:           {kv_mor}x KV reduction, PPL {mor} (vs baseline {std})")
     print(f"  MoR + TurboQuant:    {kv_ours}x KV reduction, PPL {ours} (vs baseline {std})")
-    print(f"  Multiplicative gain: MoR ({kv_mor}x) × TurboQuant ({kv_tq}x) = {kv_ours}x")
+    print(f"  Our advantage over TurboQuant: {kv_ours/kv_tq:.2f}x more compression, PPL diff: {ours-tq:+.2f}")
 
 with open("training_results.json", "w") as f:
     json.dump(all_results, f, indent=2)
