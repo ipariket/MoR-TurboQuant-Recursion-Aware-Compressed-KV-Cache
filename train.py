@@ -125,16 +125,21 @@ configs = {
         sharing_strategy="full", capacity_factor=1.0,
         routing_strategy="expert", kv_bits=0,
     ),
+    # NOTE: use_qjl=False. The QJL residual stage as implemented hurts
+    # reconstruction at this bit budget (see eval_compression_quality.py:
+    # 3-bit PolarQuant alone gives cosine ~0.83 and a 4.57x ratio, vs
+    # cosine ~0.44 with QJL on). Straight PolarQuant is the better config.
+    # Flip use_qjl=True only if/when the QJL reconstruction scaling is fixed.
     "Standard + TurboQuant": MoRConfig(
         **COMMON, n_recursions=8,
         sharing_strategy="full", capacity_factor=1.0,
-        routing_strategy="expert", kv_bits=3, use_qjl=True,
+        routing_strategy="expert", kv_bits=3, use_qjl=False,
     ),
     "MoR + TurboQuant (Ours)": MoRConfig(
         **COMMON, n_recursions=8,
         sharing_strategy="middle_cycle", n_unique_intro=1, n_unique_outro=1,
         capacity_factor=0.5, routing_strategy="expert",
-        kv_bits=3, use_qjl=True,
+        kv_bits=3, use_qjl=False,
     ),
 }
 
@@ -242,12 +247,28 @@ def train_model(name, config):
 
     print(f"\nLoading best checkpoint...")
     model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
+
+    # Clean eval: full-precision KV (no compression in the attention path)
+    model.set_kv_quant(False)
     test_ppl, test_loss, test_kv = evaluate(model, test_loader)
+
+    # Compressed eval: K/V passed through compress->decompress inside attention,
+    # so perplexity reflects the actual reconstruction error of the KV cache.
+    # This is the number that substantiates (or refutes) "no quality loss".
+    test_ppl_compressed = None
+    if config.kv_bits > 0:
+        model.set_kv_quant(True)
+        test_ppl_compressed, _, _ = evaluate(model, test_loader)
+        model.set_kv_quant(False)
+
     total_time = time.time() - start_time
 
     results = {
         "name": name,
         "test_ppl": round(test_ppl, 2),
+        "test_ppl_clean": round(test_ppl, 2),
+        "test_ppl_compressed": round(test_ppl_compressed, 2) if test_ppl_compressed is not None else None,
+        "ppl_delta_from_compression": round(test_ppl_compressed - test_ppl, 2) if test_ppl_compressed is not None else None,
         "best_val_ppl": round(best_val_ppl, 2),
         "total_params": total_params,
         "kv_compression": round(test_kv.get("compression_vs_standard", 1.0), 2),
@@ -257,7 +278,8 @@ def train_model(name, config):
         "training_time_min": round(total_time / 60, 1),
     }
 
-    print(f"\n  FINAL: Test PPL={test_ppl:.2f} | KV={results['kv_compression']}x | "
+    comp_str = f" | Compressed PPL={test_ppl_compressed:.2f} (Δ{test_ppl_compressed - test_ppl:+.2f})" if test_ppl_compressed is not None else ""
+    print(f"\n  FINAL: Test PPL={test_ppl:.2f}{comp_str} | KV={results['kv_compression']}x | "
           f"Params={total_params:,} | Time={total_time / 60:.1f}min")
 
     del model, optimizer
@@ -281,16 +303,19 @@ for name, cfg in configs.items():
 # ============================================================
 # Results table
 # ============================================================
-print(f"\n\n{'=' * 95}")
+print(f"\n\n{'=' * 110}")
 print("RESULTS: WikiText-103 Language Modeling (2 epochs, d_model=512)")
-print(f"{'=' * 95}")
-print(f"{'Model':<30} {'Test PPL':>10} {'KV Compress':>12} {'KV Bytes':>14} {'Params':>12} {'Time':>8}")
-print("-" * 95)
+print(f"{'=' * 110}")
+print(f"{'Model':<28} {'PPL(clean)':>11} {'PPL(comp)':>11} {'Δ comp':>8} {'KV ratio':>9} {'Params':>12} {'Time':>7}")
+print("-" * 110)
 for r in all_results:
     kv = f"{r['kv_compression']}x"
-    kv_bytes = f"{r['kv_actual_bytes']:,.0f}"
-    print(f"{r['name']:<30} {r['test_ppl']:>10} {kv:>12} {kv_bytes:>14} {r['total_params']:>12,} {r['training_time_min']:>6.1f}m")
-print("=" * 95)
+    pc = f"{r['test_ppl_compressed']}" if r.get('test_ppl_compressed') is not None else "—"
+    dl = f"{r['ppl_delta_from_compression']:+}" if r.get('ppl_delta_from_compression') is not None else "—"
+    print(f"{r['name']:<28} {r['test_ppl_clean']:>11} {pc:>11} {dl:>8} {kv:>9} {r['total_params']:>12,} {r['training_time_min']:>5.1f}m")
+print("=" * 110)
+print("PPL(clean) = full-precision KV.  PPL(comp) = K/V quantized->dequantized inside attention.")
+print("Δ comp is the true quality cost of the KV compression at inference.")
 
 if len(all_results) == 3:
     std, tq, ours = [r['test_ppl'] for r in all_results]

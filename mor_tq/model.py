@@ -116,7 +116,23 @@ class MoRModel(nn.Module):
         # Weight tying (embedding ↔ output head)
         self.lm_head.weight = self.token_emb.weight
 
+        # Eval-time KV-compression simulation. When enabled, attention reads
+        # K/V through compress->decompress so perplexity reflects the real
+        # reconstruction error of the cache. Off by default (training is FP).
+        self.quantize_kv_in_attn = False
+        self._attn_compressor = (
+            self.kv_cache.compressor if self.kv_cache.compress_enabled else None
+        )
+
         self._init_weights()
+
+    def set_kv_quant(self, enabled: bool):
+        """Toggle the eval-time compressed-KV attention path.
+
+        Returns the effective state (False if this model has no compressor).
+        """
+        self.quantize_kv_in_attn = bool(enabled) and self._attn_compressor is not None
+        return self.quantize_kv_in_attn
 
     def _init_weights(self):
         """Initialize weights following GPT-2 conventions."""
@@ -148,6 +164,10 @@ class MoRModel(nn.Module):
         # Reset KV cache for this forward pass
         self.kv_cache.reset()
 
+        # Handles for the optional compressed-KV attention path
+        _kvc = self._attn_compressor
+        _qkv = self.quantize_kv_in_attn
+
         # Embeddings
         positions = torch.arange(S, device=device).unsqueeze(0)
         h = self.token_emb(input_ids) + self.pos_emb(positions)
@@ -163,7 +183,7 @@ class MoRModel(nn.Module):
 
         # === Phase 1: Unique intro layers (no routing — all tokens pass through) ===
         for block in self.intro_blocks:
-            block_out, K, V = block(h)
+            block_out, K, V = block(h, kv_compressor=_kvc, quantize_kv=_qkv)
             h = block_out  # residual is inside the block
 
             # Store KV for all tokens (no routing during intro)
@@ -191,7 +211,7 @@ class MoRModel(nn.Module):
 
             # Apply shared block to ALL tokens (simpler than sparse compute),
             # but only update active ones
-            block_out, K, V = self.shared_block(h)
+            block_out, K, V = self.shared_block(h, kv_compressor=_kvc, quantize_kv=_qkv)
 
             # Residual update ONLY for active tokens
             # h[active] = block(h[active]) + h[active]  (residual)
@@ -214,7 +234,7 @@ class MoRModel(nn.Module):
 
         # === Phase 3: Unique outro layers (all tokens, no routing) ===
         for block in self.outro_blocks:
-            block_out, K, V = block(h)
+            block_out, K, V = block(h, kv_compressor=_kvc, quantize_kv=_qkv)
             h = block_out
 
             all_active = torch.ones(B, S, dtype=torch.bool, device=device)

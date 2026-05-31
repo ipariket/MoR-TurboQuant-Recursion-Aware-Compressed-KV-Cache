@@ -39,16 +39,24 @@ class MultiHeadAttention(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        kv_compressor=None,
+        quantize_kv: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, seq_len, d_model)
             attn_mask: (batch, seq_len) bool — which KV positions are valid
+            kv_compressor: optional TurboQuantCompressor. When provided together
+                with quantize_kv=True, K and V are passed through
+                compress->decompress before attention, so the quantization error
+                of the KV cache actually enters the model output. This is how the
+                inference-time quality cost of compression is measured.
+            quantize_kv: enable the compress/decompress simulation above.
 
         Returns:
             (output, keys, values)
             output: (batch, seq_len, d_model)
-            keys: (batch, n_heads, seq_len, head_dim)
+            keys: (batch, n_heads, seq_len, head_dim)   — pre-quantization (for cache accounting)
             values: (batch, n_heads, seq_len, head_dim)
         """
         B, S, D = x.shape
@@ -58,6 +66,17 @@ class MultiHeadAttention(nn.Module):
         Q = self.q_proj(x).view(B, S, H, Dh).transpose(1, 2)  # (B, H, S, Dh)
         K = self.k_proj(x).view(B, S, H, Dh).transpose(1, 2)
         V = self.v_proj(x).view(B, S, H, Dh).transpose(1, 2)
+
+        # Simulate a compressed KV cache: quantize then dequantize the K/V that
+        # attention reads. This injects the real reconstruction error into the
+        # forward pass so perplexity reflects the cost of compression.
+        # K_raw/V_raw are still returned for the cache's byte accounting.
+        K_attn, V_attn = K, V
+        if quantize_kv and kv_compressor is not None:
+            K_attn = kv_compressor.decompress(kv_compressor.compress(K)).to(Q.dtype)
+            V_attn = kv_compressor.decompress(kv_compressor.compress(V)).to(Q.dtype)
+
+        K, V = K_attn, V_attn
 
         # Scaled dot-product attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Dh)  # (B, H, S, S)
@@ -123,11 +142,15 @@ class RecursiveTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        kv_compressor=None,
+        quantize_kv: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, seq_len, d_model)
             attn_mask: (batch, seq_len) bool — valid KV positions for attention
+            kv_compressor / quantize_kv: forwarded to attention to optionally
+                simulate a compressed KV cache (see MultiHeadAttention.forward).
 
         Returns:
             (output, keys, values)
@@ -137,7 +160,9 @@ class RecursiveTransformerBlock(nn.Module):
         """
         # Pre-norm attention (GPT-style)
         normed = self.norm1(x)
-        attn_out, K, V = self.attention(normed, attn_mask)
+        attn_out, K, V = self.attention(
+            normed, attn_mask, kv_compressor=kv_compressor, quantize_kv=quantize_kv
+        )
         x_attn = x + self.dropout(attn_out)
 
         # Pre-norm FFN
